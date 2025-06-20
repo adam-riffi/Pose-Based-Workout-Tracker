@@ -1,0 +1,245 @@
+
+<!DOCTYPE html>
+<html>
+<head>
+  <title>KB-Fit v8.6 (Detection Recovery)</title>
+  <style>
+    body { margin: 0; overflow: hidden; background: #000; }
+    canvas, video { position: absolute; top: 0; left: 0; width: 100vw; height: 100vh; object-fit: cover; }
+    #counter, #feedback, #modeToggle, #debug {
+      position: absolute;
+      color: white;
+      font-size: 20px;
+      font-family: sans-serif;
+      background-color: rgba(0, 0, 0, 0.5);
+      padding: 8px 12px;
+      border-radius: 8px;
+      z-index: 2;
+    }
+    #counter { top: 10px; left: 10px; }
+    #modeToggle { top: 10px; right: 10px; cursor: pointer; }
+    #debug { bottom: 10px; left: 10px; font-size: 16px; font-family: monospace; max-width: 90vw; }
+    #feedback {
+      bottom: 20px;
+      left: 50%;
+      transform: translateX(-50%);
+      text-align: center;
+      font-weight: bold;
+    }
+  </style>
+</head>
+<body>
+  <div id="counter">Squat Reps: 0 | Kettlebell Reps: 0</div>
+  <div id="modeToggle">Mode: Squats</div>
+  <div id="feedback">Waiting...</div>
+  <div id="debug">Debug info</div>
+  <audio id="sound-ding" src="ding.mp3" preload="auto"></audio>
+  <audio id="sound-rep" src="rep.mp3" preload="auto"></audio>
+  <video id="video" autoplay muted playsinline></video>
+  <canvas id="output"></canvas>
+  <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.10.0"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@tensorflow-models/pose-detection"></script>
+  <script>
+    const video = document.getElementById('video');
+    const canvas = document.getElementById('output');
+    const ctx = canvas.getContext('2d');
+    const counterDisplay = document.getElementById('counter');
+    const feedbackDisplay = document.getElementById('feedback');
+    const debugDisplay = document.getElementById('debug');
+    const modeToggle = document.getElementById('modeToggle');
+    const ding = document.getElementById('sound-ding');
+    const rep = document.getElementById('sound-rep');
+
+    let detector;
+    let squatCount = 0;
+    let kettlebellCount = 0;
+    let state = "idle";
+    let mode = "squat";
+    const angleHistory = [];
+    const wristHistory = [];
+    let lastActionTime = 0;
+
+    modeToggle.onclick = () => {
+      mode = (mode === "squat") ? "kettlebell" : "squat";
+      state = "idle";
+      updateCounter();
+      modeToggle.innerText = "Mode: " + (mode === "squat" ? "Squats" : "Kettlebell");
+    };
+
+    function updateCounter() {
+      counterDisplay.innerText = `Squat Reps: ${squatCount} | Kettlebell Reps: ${kettlebellCount}`;
+    }
+
+    function debounce(ms = 300) {
+      const now = Date.now();
+      if (now - lastActionTime > ms) {
+        lastActionTime = now;
+        return true;
+      }
+      return false;
+    }
+
+    function getAngle(p1, p2, p3) {
+      const angle = Math.atan2(p3.y - p2.y, p3.x - p2.x) - Math.atan2(p1.y - p2.y, p1.x - p2.x);
+      let degrees = Math.abs(angle * 180.0 / Math.PI);
+      if (degrees > 180) degrees = 360 - degrees;
+      return degrees;
+    }
+
+    function drawSkeletonAndJoints(keypoints) {
+      const pairs = [
+        [5, 7], [7, 9], [6, 8], [8, 10],
+        [5, 6], [11, 12], [5, 11], [6, 12],
+        [11, 13], [13, 15], [12, 14], [14, 16]
+      ];
+      ctx.strokeStyle = "#00FFFF";
+      ctx.lineWidth = 3;
+      pairs.forEach(([i, j]) => {
+        const a = keypoints[i], b = keypoints[j];
+        if (a?.score > 0.3 && b?.score > 0.3) {
+          ctx.beginPath();
+          ctx.moveTo(a.x, a.y);
+          ctx.lineTo(b.x, b.y);
+          ctx.stroke();
+        }
+      });
+      keypoints.forEach(kp => {
+        if (kp?.score > 0.3) {
+          ctx.beginPath();
+          ctx.arc(kp.x, kp.y, 5, 0, 2 * Math.PI);
+          ctx.fillStyle = '#FFCC00';
+          ctx.fill();
+        }
+      });
+    }
+
+    function smooth(data, limit = 3) {
+      if (data.length > limit) data.shift();
+      return data.reduce((a, b) => a + b, 0) / data.length;
+    }
+
+    async function setupCamera() {
+      const stream = await navigator.mediaDevices.getUserMedia({ video: true });
+      video.srcObject = stream;
+      return new Promise(resolve => {
+        video.onloadedmetadata = () => resolve(video);
+      });
+    }
+
+    async function render() {
+      canvas.width = video.videoWidth;
+      canvas.height = video.videoHeight;
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+      const poses = await detector.estimatePoses(video);
+      poses.forEach(pose => {
+        const kp = pose.keypoints;
+
+        drawSkeletonAndJoints(kp);
+
+        const lHip = kp[11], lKnee = kp[13], lAnkle = kp[15];
+        const rHip = kp[12], rKnee = kp[14], rAnkle = kp[16];
+        const lWrist = kp[9], rWrist = kp[10];
+        const lShoulder = kp[5], rShoulder = kp[6];
+
+        const debugJoints = [];
+
+        if (mode === "squat") {
+          let angles = [];
+          if (lHip?.score > 0.3 && lKnee?.score > 0.3 && lAnkle?.score > 0.3) {
+            angles.push(getAngle(lHip, lKnee, lAnkle));
+          } else {
+            debugJoints.push("left leg missing");
+          }
+          if (rHip?.score > 0.3 && rKnee?.score > 0.3 && rAnkle?.score > 0.3) {
+            angles.push(getAngle(rHip, rKnee, rAnkle));
+          } else {
+            debugJoints.push("right leg missing");
+          }
+          if (angles.length === 0) return;
+
+          const avgAngle = angles.reduce((a, b) => a + b, 0) / angles.length;
+          angleHistory.push(avgAngle);
+          const smoothedAngle = smooth(angleHistory);
+
+          if (smoothedAngle < 100 && state === "idle" && debounce()) {
+            state = "squatting";
+            feedbackDisplay.innerText = "✅ Good squat!";
+            feedbackDisplay.style.color = "lime";
+            ding.play();
+          } else if (smoothedAngle > 140 && state === "squatting" && debounce()) {
+            state = "idle";
+            squatCount++;
+            updateCounter();
+            feedbackDisplay.innerText = "⬆️ Stand tall!";
+            feedbackDisplay.style.color = "cyan";
+            rep.play();
+          } else if (smoothedAngle >= 100 && smoothedAngle <= 140) {
+            feedbackDisplay.innerText = "⬇️ Keep going!";
+            feedbackDisplay.style.color = "orange";
+          }
+        }
+
+        if (mode === "kettlebell") {
+          let wristY = null, shoulderY = null, hipY = null;
+          if (lWrist?.score > 0.3 && rWrist?.score > 0.3) {
+            wristY = (lWrist.y + rWrist.y) / 2;
+          } else {
+            debugJoints.push("wrist(s) missing");
+          }
+
+          if (lShoulder?.score > 0.3 && rShoulder?.score > 0.3) {
+            shoulderY = (lShoulder.y + rShoulder.y) / 2;
+          } else {
+            debugJoints.push("shoulder(s) missing");
+          }
+
+          if (lHip?.score > 0.3 && rHip?.score > 0.3) {
+            hipY = (lHip.y + rHip.y) / 2;
+          } else {
+            debugJoints.push("hip(s) missing");
+          }
+
+          if (wristY && shoulderY && hipY) {
+            wristHistory.push(wristY);
+            const smoothedWrist = smooth(wristHistory);
+            const swingUp = smoothedWrist < shoulderY;
+            const swingDown = smoothedWrist > hipY + 40;
+
+            if (swingUp && state === "idle" && debounce()) {
+              state = "swinging";
+              feedbackDisplay.innerText = "↗️ Swing up!";
+              feedbackDisplay.style.color = "aqua";
+              ding.play();
+            } else if (swingDown && state === "swinging" && debounce()) {
+              state = "idle";
+              kettlebellCount++;
+              updateCounter();
+              feedbackDisplay.innerText = "✅ Good swing!";
+              feedbackDisplay.style.color = "lime";
+              rep.play();
+            } else if (!swingUp && state === "idle") {
+              feedbackDisplay.innerText = "⬆️ Swing higher!";
+              feedbackDisplay.style.color = "yellow";
+            }
+          }
+        }
+
+        debugDisplay.innerText = `Mode: ${mode} | State: ${state} | Missing: ${debugJoints.join(", ")}`;
+      });
+
+      requestAnimationFrame(render);
+    }
+
+    async function main() {
+      await setupCamera();
+      detector = await poseDetection.createDetector(poseDetection.SupportedModels.MoveNet, {
+        modelType: poseDetection.movenet.modelType.SINGLEPOSE_THUNDER
+      });
+      render();
+    }
+
+    main();
+  </script>
+</body>
+</html>
