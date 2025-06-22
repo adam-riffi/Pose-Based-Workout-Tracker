@@ -87,7 +87,3 @@ It is not a medically certified tool and should not be used to assess real-world
 🧑‍💻 Author
 Created by Adam Riffi — 2025
 Open to collaboration and feedback.
-
-yaml
-Copy
-Edit
